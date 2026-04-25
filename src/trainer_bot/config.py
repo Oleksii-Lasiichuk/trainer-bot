@@ -31,9 +31,13 @@ class Settings(BaseSettings):
 
     log_level: str = Field("INFO", alias="LOG_LEVEL")
 
-    max_history_messages: int = Field(20, alias="MAX_HISTORY_MESSAGES", ge=2, le=200)
+    max_history_messages: int = Field(12, alias="MAX_HISTORY_MESSAGES", ge=2, le=200)
     max_tool_iterations: int = Field(5, alias="MAX_TOOL_ITERATIONS", ge=1, le=20)
     request_timeout_seconds: int = Field(30, alias="REQUEST_TIMEOUT_SECONDS", ge=5, le=300)
+
+    # Soft cap on tokens sent to Groq per request (system + tools + history + new turn).
+    # Default 9000 leaves ~3000-token headroom under the 12k TPM cap on the free 70B tier.
+    groq_token_budget: int = Field(9000, alias="GROQ_TOKEN_BUDGET", ge=1000, le=200000)
 
     default_timezone: str = Field("Europe/Kyiv", alias="DEFAULT_TIMEZONE")
 

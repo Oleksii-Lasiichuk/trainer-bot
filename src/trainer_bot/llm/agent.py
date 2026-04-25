@@ -55,6 +55,82 @@ def history_to_openai_format(messages: list[Message]) -> list[dict[str, Any]]:
     return out
 
 
+def estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
+    """Cheap conservative token estimate for an OpenAI-style messages list.
+
+    ~3 chars per token (English-leaning, biased high) + small per-message overhead.
+    Good enough to keep us under Groq's per-request TPM ceiling without pulling in tiktoken.
+    """
+    total_chars = 0
+    per_msg_overhead = 0
+    for m in messages:
+        per_msg_overhead += 4
+        content = m.get("content")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif content is not None:
+            total_chars += len(json.dumps(content, default=str, ensure_ascii=False))
+        if m.get("tool_calls"):
+            total_chars += len(json.dumps(m["tool_calls"], default=str, ensure_ascii=False))
+        if m.get("tool_call_id"):
+            total_chars += len(str(m["tool_call_id"]))
+        if m.get("name"):
+            total_chars += len(str(m["name"]))
+    return per_msg_overhead + (total_chars // 3) + 1
+
+
+def prune_messages_for_budget(
+    messages: list[dict[str, Any]], budget_tokens: int
+) -> list[dict[str, Any]]:
+    """Drop oldest non-pinned messages until estimated tokens fit budget.
+
+    Pinned: leading system messages and the most recent user message. When dropping
+    an assistant message that has tool_calls, the corresponding tool messages are
+    dropped too so the remaining list stays valid for the OpenAI/Groq API
+    (every tool message must follow an assistant message that called it).
+    """
+    if estimate_message_tokens(messages) <= budget_tokens:
+        return list(messages)
+
+    head_end = 0
+    while head_end < len(messages) and messages[head_end].get("role") == "system":
+        head_end += 1
+    head = list(messages[:head_end])
+    body = list(messages[head_end:])
+
+    last_user_idx = -1
+    for i, m in enumerate(body):
+        if m.get("role") == "user":
+            last_user_idx = i
+
+    while body and last_user_idx > 0 and estimate_message_tokens(head + body) > budget_tokens:
+        dropped = body.pop(0)
+        last_user_idx -= 1
+
+        if dropped.get("role") == "assistant" and dropped.get("tool_calls"):
+            tool_call_ids = {
+                tc.get("id") for tc in dropped["tool_calls"] if isinstance(tc, dict)
+            }
+            i = 0
+            while i < last_user_idx:
+                if (
+                    body[i].get("role") == "tool"
+                    and body[i].get("tool_call_id") in tool_call_ids
+                ):
+                    body.pop(i)
+                    last_user_idx -= 1
+                else:
+                    i += 1
+
+        # Orphan tool messages at the new head have no assistant tool_calls before them
+        # and would be rejected by the API.
+        while body and last_user_idx > 0 and body[0].get("role") == "tool":
+            body.pop(0)
+            last_user_idx -= 1
+
+    return head + body
+
+
 def _serialize_tool_calls(tool_calls: list[Any] | None) -> list[dict[str, Any]] | None:
     if not tool_calls:
         return None
@@ -109,8 +185,15 @@ class Agent:
         final_text: str | None = None
         iterations = 0
 
+        # Tool schemas are sent on every call; reserve headroom for them.
+        schema_tokens = estimate_message_tokens(
+            [{"role": "system", "content": json.dumps(TOOL_SCHEMAS, ensure_ascii=False)}]
+        )
+        effective_budget = max(1000, self._settings.groq_token_budget - schema_tokens)
+
         for i in range(1, self._settings.max_tool_iterations + 1):
             iterations = i
+            messages = prune_messages_for_budget(messages, effective_budget)
             completion = await self._groq.chat(
                 messages=messages,
                 tools=TOOL_SCHEMAS,

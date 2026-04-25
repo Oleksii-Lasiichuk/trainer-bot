@@ -8,7 +8,11 @@ import pytest
 import respx
 
 from trainer_bot.intervals.client import IntervalsClient
-from trainer_bot.llm.agent import Agent
+from trainer_bot.llm.agent import (
+    Agent,
+    estimate_message_tokens,
+    prune_messages_for_budget,
+)
 from trainer_bot.storage.repositories import MessageRepository, UserRepository
 
 
@@ -184,3 +188,62 @@ async def test_agent_includes_history(db, test_settings) -> None:
         m.get("role") == "user" and m.get("content") == "second question" for m in msgs_sent
     )
     assert result.text == "ok follow-up"
+
+
+def test_estimate_message_tokens_grows_with_content() -> None:
+    short = [{"role": "user", "content": "hi"}]
+    long = [{"role": "user", "content": "x" * 3000}]
+    assert estimate_message_tokens(short) < estimate_message_tokens(long)
+
+
+def test_prune_keeps_system_and_last_user() -> None:
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old1 " + "x" * 4000},
+        {"role": "assistant", "content": "old1 reply " + "y" * 4000},
+        {"role": "user", "content": "old2 " + "x" * 4000},
+        {"role": "assistant", "content": "old2 reply " + "y" * 4000},
+        {"role": "user", "content": "current question"},
+    ]
+    pruned = prune_messages_for_budget(messages, budget_tokens=500)
+    assert pruned[0]["role"] == "system"
+    assert pruned[-1] == {"role": "user", "content": "current question"}
+    # Older heavy messages must have been dropped to fit the tiny budget.
+    assert len(pruned) < len(messages)
+    assert estimate_message_tokens(pruned) <= 500 or len(pruned) == 2
+
+
+def test_prune_drops_tool_messages_with_their_assistant() -> None:
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "Q1"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "t1", "content": "R" * 8000},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "Q2"},
+    ]
+    pruned = prune_messages_for_budget(messages, budget_tokens=200)
+    # The pruned list must not contain a tool message without its assistant tool_calls.
+    seen_tool_call_ids: set[str] = set()
+    for m in pruned:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                seen_tool_call_ids.add(tc["id"])
+        if m.get("role") == "tool":
+            assert m["tool_call_id"] in seen_tool_call_ids
+    # Last user message preserved.
+    assert pruned[-1]["content"] == "Q2"
+
+
+def test_prune_noop_when_under_budget() -> None:
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+    ]
+    assert prune_messages_for_budget(messages, budget_tokens=10_000) == messages
