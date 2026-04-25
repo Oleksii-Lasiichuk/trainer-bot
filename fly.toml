@@ -1,0 +1,25 @@
+# Fly.io deploy config for trainer-bot.
+# Adjust `app` and `primary_region` after running `fly launch` on your own fork.
+
+app = "trainer-bot"
+primary_region = "waw"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DATABASE_URL = "sqlite+aiosqlite:////app/data/bot.db"
+  LOG_LEVEL = "INFO"
+  LOG_FORMAT = "json"
+
+[[mounts]]
+  source = "trainer_data"
+  destination = "/app/data"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
+
+[deploy]
+  strategy = "immediate"

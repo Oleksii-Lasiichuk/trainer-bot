@@ -1,0 +1,15 @@
+services:
+  trainer-bot:
+    build: .
+    image: trainer-bot:latest
+    container_name: trainer-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - trainer_data:/app/data
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/bot.db
+      - LOG_FORMAT=console
+
+volumes:
+  trainer_data:
